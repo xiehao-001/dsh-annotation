@@ -1,0 +1,55 @@
+{
+  "name": "@eduwork/dsh-annotation",
+  "version": "0.1.5",
+  "description": "Select text in a finished reply, annotate it, keep numbered anchors, and send them with your next question.",
+  "type": "module",
+  "main": "lib/index.js",
+  "license": "MulanPSL-2.0 AND MIT",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json",
+    "./locale/en.json": "./locale/en.json",
+    "./locale/zh.json": "./locale/zh.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "lib/**/*",
+    "locale/*.json",
+    "icon.svg",
+    "cordis.patch.yml",
+    "README.md",
+    "MARKET.md"
+  ],
+  "dsh": {
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-input-trigger",
+        "@deepseek-ai/dsh-client-ui-chat",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-locale"
+      ],
+      "platform": "web"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": ">=24.18.0",
+    "dsh": ">=0.2.1 <0.3.0"
+  },
+  "keywords": [
+    "annotation",
+    "composer",
+    "review"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/dsh-client-ui-primitives": ">=0.2.1-rc.2 <0.3.0-0 || >=0.2.2-rc.1 <0.2.3-0",
+    "@deepseek-ai/dsh-client-ui-conversation": ">=0.2.1-rc.2 <0.3.0-0 || >=0.2.2-rc.1 <0.2.3-0",
+    "@deepseek-ai/dsh-client-ui-input-trigger": ">=0.2.1-rc.2 <0.3.0-0 || >=0.2.2-rc.1 <0.2.3-0",
+    "react": "^18.2.0",
+    "@deepseek-ai/dsh-client-ui-chat": ">=0.2.1-rc.2 <0.3.0-0 || >=0.2.2-rc.1 <0.2.3-0"
+  }
+}

@@ -1,0 +1,535 @@
+import React, { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react'
+import { createPortal } from 'react-dom'
+import { useDismissOnOutsidePointer } from '@deepseek-ai/dsh-client-ui-primitives'
+import { SOURCE, MAX_NOTE, MAX_LIVE_SNAPSHOT, decode, reference, text } from './reference.js'
+import { place } from './position.js'
+import { annotations, occurrenceSpan, selectionSource, closingMessage } from './draft.js'
+import { fragment } from '../protocol.js'
+import { AnnotatedContent } from './history.js'
+import { SENT_ANNOTATION, sentAnnotationRule } from './sent.js'
+import { createSelectionActions } from './selection-actions.js'
+
+export const inject = ['locale']
+const h = React.createElement
+const NS = 'eduwork.annotation'
+const UI = 'data-eduwork-annotation-ui'
+const MARKER = 'data-eduwork-annotation-marker'
+
+const copy = {
+  zh: {
+    selectedText: '所选文本：', expandQuote: '展开原文', collapseQuote: '收起原文', nativeQuote: '引用文本',
+    quote: '批注', notePlaceholder: '添加批注（可选）', add: '加入输入框', cancel: '取消', close: '关闭',
+    notePrefix: '批注：', noted: '批注', preview: '引用内容', invalid: '引用内容已损坏。', insertFailed: '当前无法插入引用，请稍后再试。',
+    count: '条批注', number: '批注', edit: '编辑', remove: '删除', save: '保存', empty: '暂无待发送批注',
+    editFailed: '引用已变化或输入框暂不可编辑。内容已保留，请取消后重新打开，或稍后重试。',
+    noteLabel: '批注内容', list: '待发送批注', readonly: '这条引用已不在当前草稿中，仅供查看。',
+    finishEdit: '请先保存或取消正在编辑的批注。', selectionActions: '选区操作',
+  },
+  en: {
+    selectedText: 'Selected text:', expandQuote: 'Expand quote', collapseQuote: 'Collapse quote', nativeQuote: 'Quote text',
+    quote: 'Annotate', notePlaceholder: 'Add a note (optional)', add: 'Add to message', cancel: 'Cancel', close: 'Close',
+    notePrefix: 'Note: ', noted: 'note', preview: 'Quoted text', invalid: 'This quote is damaged.', insertFailed: 'The quote cannot be inserted right now. Try again later.',
+    count: 'annotations', number: 'Annotation', edit: 'Edit', remove: 'Delete', save: 'Save', empty: 'No pending annotations',
+    editFailed: 'The reference changed or the composer is not editable. Your note is preserved. Cancel and reopen it, or retry later.',
+    noteLabel: 'Annotation text', list: 'Pending annotations', readonly: 'This reference is no longer in the current draft and is read-only.',
+    finishEdit: 'Save or cancel the current edit before opening another annotation.', selectionActions: 'Selection actions',
+  },
+}
+
+const border = 'var(--dsw-alias-border-l2, #e6e6e6)'
+const layer = 'var(--dsw-alias-bg-layer-3, #fff)'
+const primary = 'var(--dsw-alias-label-primary, #191919)'
+const secondary = 'var(--dsw-alias-label-secondary, #666)'
+const accent = 'var(--dsw-alias-state-business-primary, #9f2636)'
+const card = { position: 'fixed', zIndex: 1000, background: layer, color: primary, border: `1px solid ${border}`, borderRadius: 10, boxShadow: '0 6px 24px rgba(0,0,0,.12)', fontSize: 13 }
+const button = filled => ({ border: `1px solid ${filled ? accent : border}`, borderRadius: 7, padding: '5px 10px', background: filled ? accent : 'transparent', color: filled ? '#fff' : primary, cursor: 'pointer', fontSize: 12 })
+
+// Preserve display of messages already sent by the earlier test client.
+// Render only a display projection via DSH's public user-text node slot. React
+// escapes quote/note strings; no Markdown/HTML parsing or transcript mutation.
+// Inline-only elements also fit the official Queue and compact text surfaces.
+function SentAnnotation({ node, interactive, t }) {
+  const { index, quote, note } = node.data
+  const [expanded, setExpanded] = useState(false)
+  const collapsible = interactive && (quote.length > 240 || quote.split('\n').length > 4)
+  const collapsed = collapsible && !expanded
+  return h('span', {
+    'data-eduwork-sent-annotation': index,
+    style: { display: 'inline-block', verticalAlign: 'top', boxSizing: 'border-box', width: '100%', minWidth: 0,
+      margin: '4px 0', padding: '10px 12px', border: `1px solid ${border}`, borderRadius: 10,
+      background: layer, color: primary, whiteSpace: 'normal', lineHeight: 1.55, overflowWrap: 'anywhere' },
+  },
+  h('span', { style: { display: 'block', marginBottom: 6, fontSize: 12, color: secondary, fontWeight: 600 } }, `${t('number')} ${index}`),
+  h('span', { 'data-annotation-quote': '', style: {
+    display: collapsed ? '-webkit-box' : 'block', paddingLeft: 10, borderLeft: `2px solid ${border}`,
+    color: secondary, whiteSpace: 'pre-wrap', ...(collapsed ? { WebkitLineClamp: 3, WebkitBoxOrient: 'vertical', overflow: 'hidden' } : {}),
+  } }, quote),
+  collapsible ? h('button', { type: 'button', 'aria-expanded': expanded, onClick: () => setExpanded(value => !value),
+    style: { ...button(false), marginTop: 6 },
+  }, t(expanded ? 'collapseQuote' : 'expandQuote')) : null,
+  note === '' ? null : h('span', { 'data-annotation-note': '', style: { display: 'block', marginTop: 8, whiteSpace: 'pre-wrap' } }, note))
+}
+
+function SentAnnotations(props) {
+  const items = props.node.data.items
+  return items ? h(React.Fragment, null, ...items.map(item => h(SentAnnotation, {
+    ...props, key: item.index, node: { ...props.node, data: item },
+  }))) : h(SentAnnotation, props)
+}
+
+function createPreviews() {
+  const values = new Map()
+  const locked = new Set()
+  const listeners = new Set()
+  const emit = () => { for (const listener of listeners) listener() }
+  return {
+    get: id => values.get(id),
+    isLocked: id => locked.has(id),
+    open(id, annotation) {
+      if (locked.has(id)) {
+        const current = values.get(id)
+        if (current) { values.set(id, { ...current, blocked: true }); emit() }
+        return false
+      }
+      values.set(id, annotation); emit(); return true
+    },
+    lock(id) { locked.add(id); return () => { locked.delete(id) } },
+    close(id) { locked.delete(id); if (values.delete(id)) emit() },
+    subscribe(listener) { listeners.add(listener); return () => { listeners.delete(listener) } },
+  }
+}
+
+// Several sessions can be mounted at once. A selection belongs to the overlay
+// whose nearest ancestor containing the selection holds no other overlay.
+function ownsSelection(marker, element) {
+  let scope = marker?.parentElement
+  while (scope && !scope.contains(element)) scope = scope.parentElement
+  return scope != null && scope.querySelectorAll(`[${MARKER}]`).length === 1
+}
+
+function readSelection(marker, resolveOrigin, nativeText) {
+  const selection = document.getSelection()
+  if (!selection || selection.isCollapsed || selection.rangeCount === 0) return null
+  // New hosts project visible text themselves (including code/math/hidden
+  // elements). Read DOM only for provenance; older hosts keep their fallback.
+  const quote = nativeText ?? selection.toString().trim()
+  if (quote === '') return null
+  const range = selection.getRangeAt(0)
+  const node = range.commonAncestorContainer
+  const element = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement
+  if (!element || element.closest(`[contenteditable="true"], input, textarea, [${UI}]`)) return null
+  // Native text interactions already validate the selected area's session.
+  // The legacy path still needs its marker-based ownership check.
+  if (nativeText === undefined && !ownsSelection(marker, element)) return null
+  // The one DOM adapter: read the official Chat row identity. All message data
+  // comes from the public snapshot. Context is bounded to this selected row.
+  const row = element.closest('[data-chat-node-key]')
+  if (!row || !row.contains(range.startContainer) || !row.contains(range.endContainer)) return null
+  const source = resolveOrigin(row.getAttribute('data-chat-node-key'))
+  if (!source) return null
+  const before = range.cloneRange(), after = range.cloneRange()
+  before.selectNodeContents(row); before.setEnd(range.startContainer, range.startOffset)
+  after.selectNodeContents(row); after.setStart(range.endContainer, range.endOffset)
+  const throughSelection = range.cloneRange()
+  throughSelection.selectNodeContents(row); throughSelection.setEnd(range.endContainer, range.endOffset)
+  const liveSnapshot = source.liveKey === undefined ? undefined : {
+    key: source.liveKey, prefix: throughSelection.toString(), text: row.textContent ?? '',
+  }
+  const context = { before: before.toString().slice(-320), after: after.toString().slice(0, 320) }
+  const rects = range.getClientRects()
+  const rect = rects.length > 0 ? rects[rects.length - 1] : range.getBoundingClientRect()
+  return { quote, ...source, context, liveSnapshot, x: rect.right, y: rect.bottom, range: range.cloneRange() }
+}
+
+function useSelectionTarget(marker, paused, resolveOrigin) {
+  const [target, setTarget] = useState(null)
+  useEffect(() => {
+    if (paused) return undefined
+    let frame = 0
+    const settle = () => { cancelAnimationFrame(frame); frame = requestAnimationFrame(() => setTarget(readSelection(marker.current, resolveOrigin))) }
+    const clear = () => { if (document.getSelection()?.isCollapsed !== false) setTarget(null) }
+    document.addEventListener('mouseup', settle)
+    document.addEventListener('keyup', settle)
+    document.addEventListener('selectionchange', clear)
+    return () => {
+      cancelAnimationFrame(frame)
+      document.removeEventListener('mouseup', settle)
+      document.removeEventListener('keyup', settle)
+      document.removeEventListener('selectionchange', clear)
+    }
+  }, [marker, paused, resolveOrigin])
+  return [target, setTarget]
+}
+
+function useFloating(target) {
+  const ref = useRef(null)
+  const [position, setPosition] = useState({ left: 8, top: 8 })
+  useLayoutEffect(() => {
+    const panel = ref.current
+    const update = () => {
+      const rects = target.range?.getClientRects()
+      const anchor = rects?.length ? rects[rects.length - 1] : null
+      const size = panel.getBoundingClientRect()
+      const next = place(anchor?.right ?? target.x, anchor?.bottom ?? target.y,
+        size.width, size.height, window.innerWidth, window.innerHeight, anchor?.top ?? target.y)
+      setPosition(previous => previous.left === next.left && previous.top === next.top ? previous : next)
+    }
+    update()
+    const observer = new ResizeObserver(update)
+    observer.observe(panel)
+    // A range can move without a scroll or a panel resize (streamed text,
+    // an image loading above it, or a font change). Sample only while this
+    // floating UI is mounted; do not keep a frame loop running per session.
+    const movement = window.setInterval(update, 100)
+    document.addEventListener('scroll', update, true)
+    window.addEventListener('resize', update)
+    return () => {
+      observer.disconnect()
+      window.clearInterval(movement)
+      document.removeEventListener('scroll', update, true)
+      window.removeEventListener('resize', update)
+    }
+  }, [target])
+  return [ref, position]
+}
+
+function SelectionToolbar({ target, t, onAnnotate, actions, onAction }) {
+  const [ref, position] = useFloating(target)
+  const icon = kind => h('svg', { width: 16, height: 16, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.6, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true },
+    h('path', { d: kind === 'side-chat' ? 'M13 4h6a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6M13 4v16M4 7h5M4 12h5M4 17h5' : 'M5 4h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H9l-6 4V6a2 2 0 0 1 2-2ZM8 9h8M8 13h5' }))
+  return h('div', {
+    ref, [UI]: '', 'data-window-drag-exclude': '', 'data-eduwork-selection-toolbar': '', role: 'toolbar', 'aria-label': t('selectionActions'),
+    style: { ...card, ...position, display: 'flex', alignItems: 'center', padding: 4, borderRadius: 12, maxWidth: 'calc(100vw - 16px)' },
+    onMouseDown: event => event.preventDefault(),
+  },
+  h('style', null, '[data-eduwork-selection-toolbar] button{display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:32px;padding:6px 10px;border:0;border-radius:8px;background:transparent;color:inherit;font:inherit;white-space:nowrap;cursor:pointer}[data-eduwork-selection-toolbar] button:hover{background:var(--dsw-alias-bg-layer-2,#f5f2f1)}[data-eduwork-selection-toolbar] button:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#9f2636);outline-offset:-2px}[data-eduwork-selection-toolbar] button:disabled{opacity:.5;cursor:default}'),
+  target.canAnnotate ? h('button', { type: 'button', onClick: onAnnotate }, icon('annotation'), t('quote')) : null,
+  ...actions.map(action => h(React.Fragment, { key: action.id },
+    target.canAnnotate ? h('span', { 'aria-hidden': true, style: { height: 18, width: 1, margin: '0 3px', background: border } }) : null,
+    h('button', { type: 'button', onClick: () => onAction(action) }, action.renderIcon?.() ?? icon(action.icon), action.label()))))
+}
+
+async function runSelectionAction(target, action, sessionId, t, reportError) {
+  const snapshotText = target.liveSnapshot?.text
+  const snapshot = typeof snapshotText === 'string' && snapshotText.length <= MAX_LIVE_SNAPSHOT ? snapshotText : undefined
+  const value = reference(target.quote, '', t, target.origin,
+    { ...target.context, ...(snapshot === undefined ? {} : { snapshot }) })
+  if (!value || !Number.isSafeInteger(target.atSeq)) return
+  const payload = { sourceSessionId: sessionId, atSeq: target.atSeq, reference: value, quote: target.quote,
+    ...(target.liveSnapshot ? { liveSnapshot: snapshot === undefined ? {} : target.liveSnapshot } : {}) }
+  try { await action.run(payload) } catch { reportError(t('insertFailed')) }
+}
+
+// rc.1 owns selection admission, anchoring, scrolling and dismissal. Extend its
+// keyed surface instead of opening a second floating toolbar or patching Chat.
+function NativeSelectionToolbar({ sessionId, previews, selectionActions, editors, reportError,
+  dismiss, readText, clearSelection, inputActions, useSession, useConversation, t }) {
+  const enabled = useSession(s => !s.removed && (s.subagent === null
+    || (s.subagent.address.mode === 'continuable' && s.subagent.parentAvailable === true)))
+  const chat = useConversation(state => state.views.get('chat'))
+  const actions = useSyncExternalStore(selectionActions.subscribe, selectionActions.getSnapshot)
+  useEffect(() => { if (!enabled) dismiss() }, [enabled, dismiss])
+  if (!enabled) return null
+  const selectedText = readText()
+  const target = selectedText === null ? null : readSelection(null, key => selectionSource(chat, key, sessionId), selectedText)
+  const finish = () => { clearSelection(); dismiss() }
+  const unlocked = () => {
+    if (!previews.isLocked(sessionId)) return true
+    reportError(t('finishEdit')); return false
+  }
+  return h('div', { [UI]: '', 'data-eduwork-selection-toolbar': '', role: 'toolbar', 'aria-label': t('selectionActions'),
+    style: { ...card, position: 'relative', display: 'flex', flexWrap: 'wrap', gap: 4, padding: 4, borderRadius: 12 }, onPointerDown: event => event.preventDefault(),
+  },
+  h('button', { type: 'button', style: button(false), onClick: () => {
+    const value = readText()
+    if (value === null) { dismiss(); return }
+    if (inputActions.insertQuote(value)) finish()
+  } }, t('nativeQuote')),
+  target?.canAnnotate ? h('button', { type: 'button', style: button(false), onClick: () => {
+    if (unlocked() && editors.get(sessionId)?.(target)) finish()
+  } }, t('quote')) : null,
+  ...(target ? actions.filter(action => action.available?.(sessionId) !== false).map(action =>
+    h('button', { key: action.id, type: 'button', style: button(false), onClick: () => {
+      if (!unlocked()) return
+      finish(); void runSelectionAction(target, action, sessionId, t, reportError)
+    } }, action.label())) : []))
+}
+
+function Editor({ draft, t, onAdd, onCancel }) {
+  const [note, setNote] = useState('')
+  const [ref, position] = useFloating(draft)
+  const submit = () => onAdd(note)
+  return h('div', { ref, [UI]: '', 'data-window-drag-exclude': '', role: 'dialog', style: { ...card, ...position, width: 320, maxWidth: 'calc(100vw - 16px)', maxHeight: 'calc(100vh - 16px)', boxSizing: 'border-box', overflowY: 'auto', padding: 12 } },
+    h('div', { style: { marginBottom: 8, color: secondary, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' } }, draft.quote),
+    h('textarea', {
+      autoFocus: true, value: note, maxLength: MAX_NOTE, rows: 3, placeholder: t('notePlaceholder'), 'aria-label': t('noteLabel'),
+      onChange: event => setNote(event.target.value),
+      onKeyDown: (event) => {
+        if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return
+        if (event.key === 'Escape') onCancel()
+        if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); submit() }
+      },
+      style: { width: '100%', boxSizing: 'border-box', resize: 'vertical', border: `1px solid ${border}`, borderRadius: 7, padding: 7, font: 'inherit', background: 'transparent', color: primary },
+    }),
+    h('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 8 } },
+      h('button', { type: 'button', onClick: onCancel, style: button(false) }, t('cancel')),
+      h('button', { type: 'button', onClick: submit, style: button(true) }, t('add'))))
+}
+
+function Preview({ panel, items, sessionId, previews, t, onClose, onOpen, onSave, onRemove }) {
+  const ref = useRef(null)
+  const [editing, setEditing] = useState(false)
+  const [note, setNote] = useState(panel.annotation?.note ?? '')
+  const [failed, setFailed] = useState(false)
+  useLayoutEffect(() => editing ? previews.lock(sessionId) : undefined, [editing, previews, sessionId])
+  const entry = panel.occurrenceId === undefined ? undefined : items.find(item =>
+    item.occurrenceId === panel.occurrenceId && item.ref === panel.ref)
+  const annotation = panel.annotation
+  const save = () => { if (!onSave(panel, note)) setFailed(true) }
+  const remove = () => { if (!onRemove(panel)) setFailed(true) }
+  useDismissOnOutsidePointer(ref, !editing, onClose)
+  useEffect(() => {
+    const onKey = (event) => { if (event.key === 'Escape') onClose() }
+    const onOutside = (event) => { if (!ref.current?.contains(event.target)) onClose() }
+    // Do not discard an unfinished edit when focus moves to the composer/window.
+    // Closing while editing is an explicit Cancel action below.
+    if (editing) return undefined
+    document.addEventListener('keydown', onKey)
+    document.addEventListener('focusin', onOutside)
+    window.addEventListener('blur', onClose)
+    return () => {
+      document.removeEventListener('keydown', onKey)
+      document.removeEventListener('focusin', onOutside)
+      window.removeEventListener('blur', onClose)
+    }
+  }, [onClose, editing])
+  // Bound the whole preview, not only the quote: long notes must remain
+  // readable and the dialog must fit even when the window is short.
+  return h('div', { ref, [UI]: '', 'data-window-drag-exclude': '', role: 'dialog', 'aria-label': t(panel.kind === 'list' ? 'list' : 'preview'), style: { ...card, left: '50%', bottom: 'min(160px, 20vh)', transform: 'translateX(-50%)', width: 'min(560px, calc(100vw - 32px))', maxHeight: 'calc(100vh - min(160px, 20vh) - 16px)', boxSizing: 'border-box', overflowY: 'auto', padding: 14 } },
+    h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 } },
+      h('strong', null, entry ? `${t('number')} ${entry.number}` : t(panel.kind === 'list' ? 'list' : 'preview')),
+      h('button', { type: 'button', onClick: onClose, style: button(false) }, t(editing ? 'cancel' : 'close'))),
+    panel.kind === 'list'
+      ? items.length === 0 ? h('p', null, t('empty')) : h('ol', { style: { paddingLeft: 24, marginBottom: 0 } }, items.map(item =>
+        h('li', { key: item.occurrenceId, style: { paddingBottom: 6 } }, h('button', {
+          type: 'button', onClick: () => onOpen(item), style: { ...button(false), width: '100%', textAlign: 'left', whiteSpace: 'normal', overflowWrap: 'anywhere' },
+        }, item.annotation.quote.length > 100 ? `${item.annotation.quote.slice(0, 100)}…` : item.annotation.quote))))
+      : h(React.Fragment, null,
+        h('blockquote', { style: { margin: 0, padding: '0 0 0 10px', borderLeft: `3px solid ${border}`, color: secondary, maxHeight: 240, overflow: 'auto', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' } }, annotation.quote),
+        editing ? h('textarea', {
+          autoFocus: true, value: note, maxLength: MAX_NOTE, rows: 4, 'aria-label': t('noteLabel'),
+          onChange: event => setNote(event.target.value),
+          onKeyDown: event => {
+            if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return
+            if (event.key === 'Escape') { event.preventDefault(); onClose() }
+            if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); save() }
+          },
+          style: { width: '100%', boxSizing: 'border-box', marginTop: 10, padding: 8, border: `1px solid ${border}`, borderRadius: 7, font: 'inherit', background: 'transparent', color: primary },
+        }) : annotation.note === '' ? null : h('p', { style: { margin: '10px 0 0', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' } }, `${t('notePrefix')}${annotation.note}`),
+        !entry && !editing ? h('p', { style: { color: secondary } }, t('readonly')) : null,
+        failed ? h('p', { role: 'alert' }, t('editFailed')) : null,
+        panel.blocked ? h('p', { role: 'status' }, t('finishEdit')) : null,
+        entry || editing ? h('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 12 } },
+          h('button', { type: 'button', onClick: remove, style: button(false) }, t('remove')),
+          h('button', { type: 'button', onClick: editing ? save : () => setEditing(true), style: button(true) }, t(editing ? 'save' : 'edit'))) : null))
+}
+
+function entryPanel(item) {
+  return { kind: 'entry', occurrenceId: item.occurrenceId, ref: item.ref, annotation: item.annotation }
+}
+
+function AnnotationCount({ sessionId, previews, useInput, t }) {
+  const occurrences = useInput(state => state.occurrences)
+  const count = annotations(occurrences).length
+  return count === 0 ? null : h('button', {
+    [UI]: '', type: 'button', style: button(false), onClick: () => previews.open(sessionId, { kind: 'list' }),
+  }, `${count} ${t('count')}`)
+}
+
+function MessageAnnotations({ sessionId, turn, previews, useInput, useConversation, t }) {
+  const messageId = useConversation(state => closingMessage(state.views.get('chat'), turn.turn))
+  const occurrences = useInput(state => state.occurrences)
+  const items = annotations(occurrences).filter(item => item.annotation.origin?.sessionId === sessionId && item.annotation.origin.messageId === messageId)
+  return items.length === 0 ? null : h('span', { [UI]: '', 'data-eduwork-annotation-message': messageId, style: { display: 'inline-flex', gap: 4, flexWrap: 'wrap', alignItems: 'center' } },
+    h('span', { style: { fontSize: 12, color: secondary } }, t('number')),
+    ...items.map(item => h('button', {
+      key: item.occurrenceId, type: 'button', 'aria-label': `${t('number')} ${item.number}`, title: item.annotation.quote.slice(0, 120),
+      style: { ...button(false), padding: '2px 7px', minWidth: 28, minHeight: 28, borderRadius: 20 }, onClick: () => previews.open(sessionId, entryPanel(item)),
+    }, String(item.number))))
+}
+
+function AnnotationOverlay({ sessionId, previews, selectionActions, editors, nativeSelection, reportError, insert, mutate, t, inputActions, useInput, useConversation }) {
+  const marker = useRef(null)
+  const [draft, setDraft] = useState(null)
+  const chat = useConversation(state => state.views.get('chat'))
+  const chatRef = useRef(chat)
+  chatRef.current = chat
+  const resolver = useRef(key => selectionSource(chatRef.current, key, sessionId))
+  const [target, setTarget] = useSelectionTarget(marker, nativeSelection || draft !== null, resolver.current)
+  const occurrences = useInput(state => state.occurrences)
+  const items = annotations(occurrences)
+  const preview = useSyncExternalStore(previews.subscribe, () => previews.get(sessionId))
+  const availableActions = useSyncExternalStore(selectionActions.subscribe, selectionActions.getSnapshot)
+  useLayoutEffect(() => draft ? previews.lock(sessionId) : undefined, [draft, previews, sessionId])
+  useEffect(() => () => previews.close(sessionId), [previews, sessionId])
+  useEffect(() => {
+    const open = target => {
+      if (previews.isLocked(sessionId)) return false
+      previews.close(sessionId); setDraft(target); return true
+    }
+    editors.set(sessionId, open)
+    return () => { if (editors.get(sessionId) === open) editors.delete(sessionId) }
+  }, [editors, previews, sessionId])
+  const add = (note) => {
+    const value = reference(draft.quote, note, t, draft.origin, draft.context)
+    // The official composer may reject an insertion while submitting or
+    // after a draft revision changes. Keep the editor and note for retry.
+    if (value !== undefined && insert(value, inputActions) === true) setDraft(null)
+  }
+  return h('span', { [MARKER]: '', ref: marker, hidden: true },
+    target && !draft && (target.canAnnotate || availableActions.some(action => action.available?.(sessionId) !== false)) ? createPortal(h(SelectionToolbar, {
+      target, t, actions: availableActions.filter(action => action.available?.(sessionId) !== false),
+      onAction: async action => {
+        if (previews.isLocked(sessionId)) { previews.open(sessionId, { kind: 'list' }); return }
+        setTarget(null); document.getSelection()?.removeAllRanges()
+        await runSelectionAction(target, action, sessionId, t, reportError)
+      },
+      onAnnotate: () => {
+        if (previews.isLocked(sessionId)) { previews.open(sessionId, { kind: 'list' }); return }
+        previews.close(sessionId)
+        setDraft(target); setTarget(null); document.getSelection()?.removeAllRanges()
+      },
+    }), document.body) : null,
+    draft ? createPortal(h(Editor, { draft, t, onAdd: add, onCancel: () => setDraft(null) }), document.body) : null,
+    preview ? createPortal(h(Preview, {
+      key: `${preview.kind}:${preview.occurrenceId ?? preview.ref ?? ''}`, panel: preview, items, sessionId, previews, t,
+      onClose: () => previews.close(sessionId), onOpen: item => previews.open(sessionId, entryPanel(item)),
+      onSave: (expected, note) => {
+        const value = reference(expected.annotation.quote, note, t, expected.annotation.origin, expected.annotation.context)
+        if (!value || !mutate(expected, value, inputActions)) return false
+        previews.close(sessionId); return true
+      },
+      onRemove: expected => {
+        if (!mutate(expected, null, inputActions)) return false
+        previews.close(sessionId); return true
+      },
+    }), document.body) : null)
+}
+
+export function apply(ctx) {
+  ctx.effect(() => ctx.locale.register(NS, copy), 'annotation: dictionaries')
+  const t = ctx.locale.bind(NS)
+  const previews = createPreviews()
+  const selectionActions = createSelectionActions()
+  // Only editor callbacks live here; all draft content remains in DSH's composer.
+  const editors = new Map()
+  ctx.provide('annotationSelection', selectionActions)
+  ctx.inject(['uiConversation', 'slots'], scope => {
+    scope.effect(() => scope.uiConversation.userText.register(sentAnnotationRule), 'annotation: sent text projection')
+    scope.slots.inject('conversation.user.text.node', () => scope.slots.register({
+      name: 'conversation.user.text.node', key: SENT_ANNOTATION, priority: 100, locale: NS,
+    }, SentAnnotations))
+  })
+  ctx.inject(['inputTriggers', 'slots', 'sessions', 'uiConversation'], (scope) => {
+    const nativeSelection = typeof scope.uiConversation.interactions?.register === 'function'
+    const reportError = (sessionId, message) => {
+      const actx = scope.sessions.scope(sessionId)
+      if (actx) scope.get('conversation')?.input?.for(actx).notify('error', message)
+    }
+    if (nativeSelection) {
+      scope.effect(() => scope.uiConversation.interactions.register({
+        id: 'eduwork-annotation', onInteraction(request) {
+          if (request.trigger !== 'selection' || request.readText() === null) return
+          const session = scope.sessions.binding(request.sessionId)?.session.getSnapshot()
+          if (!session || session.removed || (session.subagent !== null
+            && (session.subagent.address.mode !== 'continuable' || session.subagent.parentAvailable !== true))) return
+          request.open()
+        },
+      }), 'annotation: native selection')
+      // Slot shadowing is ascending: rank before the official Quote entry at
+      // priority 0. Disposing this plugin restores its original renderer.
+      // The second key also works without message-quotes.
+      for (const key of ['quote', 'eduwork-annotation']) scope.slots.inject('conversation.chat.text-interaction', () => scope.slots.register({
+        name: 'conversation.chat.text-interaction', key, priority: -100, locale: NS,
+        inject: sessionId => ({ sessionId, previews, selectionActions, editors,
+          reportError: message => reportError(sessionId, message) }),
+      }, NativeSelectionToolbar))
+    }
+    // Codec-only source: the official submit path serializes our chips, and
+    // the empty candidate group never shows in the @ menu.
+    scope.effect(() => scope.inputTriggers.registerSource({
+      trigger: '@', name: SOURCE, order: 1000, showGroupTitle: false,
+      candidates: async () => [],
+      onPick: () => undefined,
+      openReference(session, value) {
+        const annotation = decode(value.ref)
+        if (annotation === undefined) return false
+        const actx = scope.sessions.scope(session.sessionId)
+        const input = actx && scope.get('conversation')?.input?.for(actx)
+        const matches = annotations(input?.state.getSnapshot().occurrences ?? []).filter(item => item.ref === value.ref)
+        // A copied chip may have the same payload twice. Do not guess which
+        // occurrence was clicked: let the native-order list disambiguate.
+        previews.open(session.sessionId, matches.length > 1 ? { kind: 'list' } : matches.length === 1
+          ? entryPanel(matches[0]) : { kind: 'entry', ref: value.ref, annotation })
+        return true
+      },
+      codec: {
+        clipboardText: (ref) => { const annotation = decode(ref); return annotation ? text(annotation, t) : '' },
+        serialize: async (ref) => {
+          const annotation = decode(ref)
+          if (annotation === undefined) throw new Error(t('invalid'))
+          return fragment(annotation)
+        },
+      },
+    }), 'annotation: reference source')
+    scope.slots.inject('conversation.chat.user.decorate', () => scope.slots.register({
+      name: 'conversation.chat.user.decorate', id: 'eduwork-annotation', locale: NS,
+    }, AnnotatedContent))
+    scope.slots.inject('conversation.input.overlay', () => scope.slots.register({
+      name: 'conversation.input.overlay', id: 'eduwork-annotation', order: 10, locale: NS,
+      inject: sessionId => ({
+        sessionId, previews, selectionActions, editors, nativeSelection,
+        reportError(message) {
+          const actx = scope.sessions.scope(sessionId)
+          if (actx) scope.get('conversation')?.input?.for(actx).notify('error', message)
+        },
+        insert(value, inputActions) {
+          const actx = scope.sessions.scope(sessionId)
+          if (actx === undefined) return false
+          const caret = inputActions.captureInsertion()
+          const span = { start: caret.end, end: caret.end, draftRev: caret.draftRev }
+          const input = scope.get('conversation')?.input?.for(actx)
+          const accepted = actx.bail(actx, 'slash/input-insert-reference', { reference: value, span }) === true
+          if (accepted) input?.focus()
+          else input?.notify('error', t('insertFailed'))
+          return accepted
+        },
+        mutate(expected, value, inputActions) {
+          const actx = scope.sessions.scope(sessionId)
+          const input = actx && scope.get('conversation')?.input?.for(actx)
+          if (!input) return false
+          // rc.1's InputState omits native quotes; its semantic snapshot retains
+          // them. This read-only facade adapter never reaches into Lexical or
+          // browser storage. Fail closed if the new facade lacks the snapshot.
+          const document = nativeSelection ? input.draftSnapshot : undefined
+          if (nativeSelection && document === undefined) return false
+          const span = occurrenceSpan(input.state.getSnapshot(), expected, document)
+          if (!span) return false
+          const accepted = value === null ? inputActions.insertText('', span)
+            : actx.bail(actx, 'slash/input-insert-reference', { reference: value, span }) === true
+          if (accepted) input.focus()
+          return accepted
+        },
+      }),
+    }, AnnotationOverlay))
+    for (const [name, component] of [
+      ['conversation.input.left', AnnotationCount],
+      // The official tail slot stays visible on older replies and can wrap.
+      // The icon-actions row deliberately hides on hover and has fixed height.
+      ['conversation.chat.turnTail', MessageAnnotations],
+    ]) scope.slots.inject(name, () => scope.slots.register({
+      name, id: 'eduwork-annotation', order: 10, locale: NS,
+      inject: sessionId => ({ sessionId, previews }),
+    }, component))
+  })
+}
